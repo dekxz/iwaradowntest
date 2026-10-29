@@ -62,4 +62,6 @@ dependencies {
     // yt-dlp + Python + ffmpeg for Android
     implementation("io.github.junkfood02.youtubedl-android:library:0.17.2")
     implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.17.2")
+    // aria2c: multi-connection downloader that yt-dlp can hand the direct file link to
+    implementation("io.github.junkfood02.youtubedl-android:aria2c:0.17.2")
 }

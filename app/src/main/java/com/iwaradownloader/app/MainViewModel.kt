@@ -184,20 +184,48 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** [login] is false for direct file links: no yt-dlp extractor is involved, so no credentials are needed. */
-    private suspend fun ytdlp(target: String, login: Boolean = true, configure: YoutubeDLRequest.() -> Unit): String =
+    private suspend fun ytdlp(
+        target: String,
+        login: Boolean = true,
+        aria2: Boolean = false,
+        configure: YoutubeDLRequest.() -> Unit
+    ): String =
         withContext(Dispatchers.IO) {
-            val req = YoutubeDLRequest(target)
-            req.configure()
-            if (login && useAccount.value && account.hasAccount()) {
-                // Iwara logs in through its API; yt-dlp's Iwara extractor reads these two options.
-                req.addOption("--username", account.email)
-                req.addOption("--password", account.password)
+            fun run(useAria2: Boolean): String {
+                val req = YoutubeDLRequest(target)
+                req.configure()
+                if (login && useAccount.value && account.hasAccount()) {
+                    // Iwara logs in through its API; yt-dlp's Iwara extractor reads these two options.
+                    req.addOption("--username", account.email)
+                    req.addOption("--password", account.password)
+                }
+                if (useAria2) {
+                    // 16 connections to the same file, 1 MB pieces; no pre-allocation so progress starts at once
+                    req.addOption("--downloader", "libaria2c.so")
+                    req.addOption(
+                        "--external-downloader-args",
+                        "aria2c:-x 16 -s 16 -k 1M --file-allocation=none --summary-interval=1"
+                    )
+                }
+                val response = YoutubeDL.getInstance().execute(req, pid) { progress, _, line ->
+                    // Skip per-percent spam, keep the meaningful lines.
+                    if (line.isNotBlank() && !(line.contains("ETA") && !line.contains("100%"))) log(line.trim())
+                }
+                return response.out
             }
-            val response = YoutubeDL.getInstance().execute(req, pid) { progress, _, line ->
-                // Skip per-percent spam, keep the meaningful lines.
-                if (line.isNotBlank() && !(line.contains("ETA") && !line.contains("100%"))) log(line.trim())
-            }
-            response.out
+
+            if (aria2 && App.aria2Ready) {
+                log("Using aria2c (16 connections)")
+                try {
+                    run(true)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    if (cancelled) throw e
+                    log("aria2c failed (${e.message?.lineSequence()?.firstOrNull()}), retrying with the normal downloader...")
+                    run(false)
+                }
+            } else run(false)
         }
 
     // ---- fetch formats ----
@@ -337,7 +365,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
         when (fmt) {
             Fmt.MP4 -> {
-                ytdlp(file.url, login = false) {
+                ytdlp(file.url, login = false, aria2 = true) {
                     addOption("--referer", "https://www.iwara.tv/")
                     addOption("-o", template)
                     addOption("--merge-output-format", "mp4")
@@ -345,7 +373,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
             Fmt.GIF -> {
                 log("--- Starting GIF Conversion ---")
-                ytdlp(file.url, login = false) {
+                ytdlp(file.url, login = false, aria2 = true) {
                     addOption("--referer", "https://www.iwara.tv/")
                     addOption("-o", template)
                     addOption("--recode-video", "gif")
@@ -359,7 +387,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
             Fmt.MP3 -> {
                 log("--- Starting MP3 Conversion ---")
-                ytdlp(file.url, login = false) {
+                ytdlp(file.url, login = false, aria2 = true) {
                     addOption("--referer", "https://www.iwara.tv/")
                     addOption("-o", template)
                     addOption("-x")

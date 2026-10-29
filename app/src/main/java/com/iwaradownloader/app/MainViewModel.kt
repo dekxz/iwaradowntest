@@ -319,8 +319,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val name = Utils.sanitizeFilename(base)
         log("Sanitized Filename: $name\n")
 
-        // '%' must be escaped inside yt-dlp output templates
-        val template = File(work, name.replace("%", "%%")).absolutePath + ".%(ext)s"
+        // yt-dlp runs inside an embedded Python whose locale may not be UTF-8, which mangles or rejects
+        // Chinese/Japanese/Korean names. So it writes to a plain ASCII name and the real (Unicode) name
+        // is applied when the finished file is moved to Downloads.
+        val template = File(work, "media").absolutePath + ".%(ext)s"
 
         val file = when (fmt) {
             // Iwara serves complete MP4s ("source", "540", "360"), so no separate audio is merged.
@@ -369,7 +371,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             Fmt.IMAGE -> Unit
         }
         val finalExt = when (fmt) { Fmt.GIF -> "gif"; Fmt.MP3 -> "mp3"; else -> null }
-        return exportOutputs(work, finalExt)
+        return exportOutputs(work, finalExt, name)
     }
 
     private suspend fun downloadImages(link: Utils.IwaraLink, work: File): Int {
@@ -381,18 +383,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         post.files.forEachIndexed { i, file ->
             currentCoroutineContext().ensureActive()
             // "<uploader> - <title>_<num>.<ext>"
-            val label = post.title.ifBlank { link.id }.take(50)
+            val label = Utils.takeChars(post.title.ifBlank { link.id }, 50)
             val base = if (post.uploader.isNotEmpty()) "${post.uploader} - $label" else label
             val name = Utils.sanitizeFilename(base, 80) + "_${i + 1}"
-            val f = File(work, "$name.${file.ext}")
+            val f = File(work, "image.${file.ext}")
             images.download(file.url, f)
-            saved += exportOutputs(work)
+            saved += exportOutputs(work, null, name)
         }
         return saved
     }
 
     /** Moves finished files from the work dir into Downloads/IwaraDownloader. */
-    private fun exportOutputs(work: File, onlyExt: String? = null): Int {
+    private fun exportOutputs(work: File, onlyExt: String? = null, baseName: String? = null): Int {
         var n = 0
         work.listFiles()?.filter { f ->
             f.isFile && listOf("part", "ytdl", "temp").none { f.name.endsWith(".$it") }
@@ -403,7 +405,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 return@forEach
             }
             // Never overwrite: Name, Name_1, Name_2 ...
-            val finalName = MediaExporter.uniqueName(ctx, f.nameWithoutExtension, f.extension)
+            val finalName = MediaExporter.uniqueName(ctx, baseName ?: f.nameWithoutExtension, f.extension)
             if (MediaExporter.export(ctx, f, finalName)) {
                 log("Saved: $finalName")
                 n++

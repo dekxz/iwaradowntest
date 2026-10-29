@@ -167,11 +167,28 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         return link
     }
 
-    private suspend fun ytdlp(target: String, configure: YoutubeDLRequest.() -> Unit): String =
+    private fun credentials(): Pair<String, String>? =
+        if (useAccount.value && account.hasAccount()) account.email to account.password else null
+
+    private fun rank(name: String): Int = when {
+        name.equals("source", true) -> Int.MAX_VALUE
+        name.equals("preview", true) -> -1
+        else -> name.toIntOrNull() ?: 0
+    }
+
+    /** First format named in [prefer] (e.g. "540"), otherwise the best one ("Source"). The short preview clip is ignored. */
+    private fun choose(formats: List<IwaraImages.VideoFormat>, prefer: List<String>): IwaraImages.VideoFormat {
+        val usable = formats.filter { !it.name.equals("preview", true) }.ifEmpty { formats }
+        for (p in prefer) usable.firstOrNull { it.name.equals(p, true) }?.let { return it }
+        return usable.maxByOrNull { rank(it.name) } ?: error("no downloadable video file found")
+    }
+
+    /** [login] is false for direct file links: no yt-dlp extractor is involved, so no credentials are needed. */
+    private suspend fun ytdlp(target: String, login: Boolean = true, configure: YoutubeDLRequest.() -> Unit): String =
         withContext(Dispatchers.IO) {
             val req = YoutubeDLRequest(target)
             req.configure()
-            if (useAccount.value && account.hasAccount()) {
+            if (login && useAccount.value && account.hasAccount()) {
                 // Iwara logs in through its API; yt-dlp's Iwara extractor reads these two options.
                 req.addOption("--username", account.email)
                 req.addOption("--password", account.password)
@@ -202,10 +219,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         qualityIndex.value = 0
         launchJob {
             try {
-                val out = ytdlp(link.canonical) { addOption("--list-formats") }
-                val parsed = parseFormats(out)
-                if (parsed.isEmpty()) log("\nCould not parse specific formats, will use 'best'.")
-                qualities.value = listOf(Quality("Best", "best")) + parsed.reversed() // best first
+                val post = images.fetchVideo(link.id, credentials())
+                val parsed = post.formats
+                    .filter { !it.name.equals("preview", true) }
+                    .sortedByDescending { rank(it.name) } // best first
+                    .map {
+                        val h = it.name.toIntOrNull()
+                        Quality(if (h != null) "${it.name}: ${it.ext} @ ${h}p" else "${it.name}: ${it.ext}", it.name)
+                    }
+                log("Found ${parsed.size} format(s)")
+                if (parsed.isEmpty()) log("\nCould not find specific formats, will use 'best'.")
+                qualities.value = listOf(Quality("Best", "best")) + parsed
             } catch (e: Exception) {
                 qualities.value = listOf(Quality("Best", "best"))
                 log("ERROR: ${e.message}")
@@ -215,30 +239,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 qualityEnabled.value = true
             }
         }
-    }
-
-    /**
-     * Reads yt-dlp's format table. Iwara offers muxed MP4s named "source", "540", "360" plus a short
-     * "preview" clip, which is left out. Works with both the old ("|") and the new ("│") table style.
-     */
-    private fun parseFormats(output: String): List<Quality> {
-        val result = mutableListOf<Quality>()
-        var inSection = false
-        for (line in output.lines()) {
-            if ("ID" in line && "EXT" in line && "RESOLUTION" in line) { inSection = true; continue }
-            if (!inSection) continue
-            val l = line.trim()
-            if (l.isEmpty() || l.all { it in "-─|│+ " }) continue
-            val columns = l.substringBefore('│').substringBefore('|').trim().split(Regex("\\s+"))
-            if (columns.size < 2) continue
-            val id = columns[0]
-            val ext = columns[1]
-            val res = columns.getOrElse(2) { "" }
-            if (id.equals("preview", ignoreCase = true) || res == "audio") continue
-            val text = if (res.isNotEmpty() && res != "unknown") "$id: $ext @ $res" else "$id: $ext"
-            result += Quality(text, id)
-        }
-        return result
     }
 
     // ---- download / cancel ----
@@ -307,14 +307,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun downloadMedia(link: Utils.IwaraLink, fmt: Fmt, ident: String, work: File): Int {
-        val u = link.canonical
         log("--- Fetching video info to create filename... ---")
-        val info = ytdlp(u) { addOption("--print", "%(uploader|)s|||%(title)s") }
-            .lines().map { it.trim() }
-            .firstOrNull { "|||" in it }
-            ?: error("Could not read the video info. The video may be private (log in) or yt-dlp's Iwara support needs an update.")
-        val uploader = info.substringBefore("|||").trim()
-        val title = info.substringAfter("|||").trim()
+        // Iwara's API is queried here (OkHttp) instead of through yt-dlp's Iwara extractor, which needs
+        // browser impersonation that the bundled yt-dlp cannot do. yt-dlp only gets the direct file link.
+        val post = images.fetchVideo(link.id, credentials())
+        val uploader = post.uploader.trim()
+        val title = post.title.trim()
 
         // "<uploader> - <title>"
         val base = if (uploader.isNotEmpty()) "$uploader - $title" else title
@@ -324,22 +322,30 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // '%' must be escaped inside yt-dlp output templates
         val template = File(work, name.replace("%", "%%")).absolutePath + ".%(ext)s"
 
+        val file = when (fmt) {
+            // Iwara serves complete MP4s ("source", "540", "360"), so no separate audio is merged.
+            Fmt.MP4 -> choose(post.formats, if (ident == "best") emptyList() else listOf(ident))
+            // a mid-size source is plenty for a 640px-wide GIF and converts much faster than "source"
+            Fmt.GIF -> choose(post.formats, listOf("540", "360"))
+            // no audio-only stream on Iwara: take a small complete MP4 and extract its audio
+            Fmt.MP3 -> choose(post.formats, listOf("360", "540"))
+            Fmt.IMAGE -> error("not a video format")
+        }
+        log("Using format: ${file.name}")
+
         when (fmt) {
             Fmt.MP4 -> {
-                // Iwara serves complete MP4s ("source", "540", "360"), so no separate audio is merged.
-                val sel = if (ident == "best") "source/Source/bv*+ba/b" else ident
-                ytdlp(u) {
+                ytdlp(file.url, login = false) {
+                    addOption("--referer", "https://www.iwara.tv/")
                     addOption("-o", template)
-                    addOption("--format", sel)
                     addOption("--merge-output-format", "mp4")
                 }
             }
             Fmt.GIF -> {
                 log("--- Starting GIF Conversion ---")
-                ytdlp(u) {
+                ytdlp(file.url, login = false) {
+                    addOption("--referer", "https://www.iwara.tv/")
                     addOption("-o", template)
-                    // a mid-size source is plenty for a 640px-wide GIF and converts much faster than "source"
-                    addOption("--format", "540/360/bv*/b")
                     addOption("--recode-video", "gif")
                     // Same filter chain as the desktop app's ffmpeg call (-an drops any audio)
                     addOption(
@@ -351,10 +357,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
             Fmt.MP3 -> {
                 log("--- Starting MP3 Conversion ---")
-                ytdlp(u) {
+                ytdlp(file.url, login = false) {
+                    addOption("--referer", "https://www.iwara.tv/")
                     addOption("-o", template)
-                    // no audio-only stream on Iwara: take a small complete MP4 and extract its audio
-                    addOption("--format", "ba/360/540/b")
                     addOption("-x")
                     addOption("--audio-format", "mp3")
                     addOption("--audio-quality", "0")

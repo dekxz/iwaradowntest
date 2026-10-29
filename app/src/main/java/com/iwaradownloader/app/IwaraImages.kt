@@ -1,24 +1,33 @@
 package com.iwaradownloader.app
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
 /**
- * Android replacement for gallery-dl's image mode for Iwara image posts (iwara.tv/image/<id>).
- * Uses the Iwara API: GET /image/<id> lists the files, originals live on i.iwara.tv.
+ * Talks to the Iwara API directly (OkHttp):
+ *  - image posts (iwara.tv/image/<id>): GET /image/<id> lists the files, originals live on i.iwara.tv.
+ *  - video posts (iwara.tv/video/<id>): GET /video/<id> gives a file-list URL, which is queried with an
+ *    X-Version header; this replaces yt-dlp's Iwara extractor, whose API calls need browser
+ *    impersonation (curl_cffi), which the bundled yt-dlp on Android cannot provide.
  * Public posts need no login; with an account the API access token is sent as a Bearer header.
  */
 class IwaraImages {
 
     data class ImageFile(val url: String, val ext: String)
     data class Post(val title: String, val uploader: String, val files: List<ImageFile>)
+    data class VideoFormat(val name: String, val url: String, val ext: String)
+    data class VideoPost(val title: String, val uploader: String, val formats: List<VideoFormat>)
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
@@ -31,6 +40,8 @@ class IwaraImages {
     // Iwara moved its API between hosts during 2026, so both are tried in order.
     private val apiRoots = listOf("https://api.iwara.tv", "https://apiq.iwara.tv")
     private val fileRoot = "https://i.iwara.tv"
+    // Salt for the X-Version header of the video file list (same value yt-dlp's extractor uses).
+    private val xVersionSalt = "mSvL05GfEmeEmsEYfGCnVpEjYgTJraJN"
 
     private fun JSONObject.str(key: String): String {
         val v = opt(key)
@@ -90,6 +101,75 @@ class IwaraImages {
             }
         }
         error("ERROR: could not get images.\n" + errors.joinToString("\n"))
+    }
+
+    // ---- videos ----
+    private fun sha1Hex(s: String): String =
+        MessageDigest.getInstance("SHA-1").digest(s.toByteArray()).joinToString("") { "%02x".format(it) }
+
+    private fun getArray(url: String, xVersion: String): JSONArray {
+        val req = Request.Builder().url(url)
+            .header("User-Agent", userAgent)
+            .header("Accept", "application/json")
+            .header("Origin", "https://www.iwara.tv")
+            .header("Referer", "https://www.iwara.tv/")
+            .header("X-Version", xVersion)
+            .build()
+        client.newCall(req).execute().use { resp ->
+            val text = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) error("HTTP ${resp.code} ${text.take(120).replace('\n', ' ')}")
+            return try { JSONArray(text) } catch (_: Exception) { error("unexpected response while listing the video files") }
+        }
+    }
+
+    /** Video info + direct file links ("Source", "540", "360", "preview"). */
+    suspend fun fetchVideo(id: String, credentials: Pair<String, String>?): VideoPost = withContext(Dispatchers.IO) {
+        val errors = mutableListOf<String>()
+        for (root in apiRoots) {
+            try {
+                val token = credentials?.let { accessToken(root, it.first, it.second) }
+                return@withContext parseVideo(call("$root/video/$id", token))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                errors += "${root.removePrefix("https://")}: ${e.message}"
+            }
+        }
+        error("ERROR: could not get the video.\n" + errors.joinToString("\n") + "\n(private videos need a login)")
+    }
+
+    private fun parseVideo(json: JSONObject): VideoPost {
+        val fileUrl = json.str("fileUrl")
+        if (fileUrl.isEmpty()) {
+            val msg = json.str("message")
+            error(
+                when {
+                    msg.isNotEmpty() -> "Iwara says: $msg (private videos need a login)"
+                    json.str("embedUrl").isNotEmpty() -> "this video is embedded from another site and cannot be downloaded here"
+                    else -> "this video is unplayable"
+                }
+            )
+        }
+        val http = fileUrl.toHttpUrlOrNull() ?: error("unexpected file URL from Iwara")
+        val last = http.pathSegments.lastOrNull { it.isNotEmpty() } ?: error("unexpected file URL from Iwara")
+        val expires = http.queryParameter("expires") ?: error("file URL from Iwara has no expiry")
+        val files = getArray(fileUrl, sha1Hex("${last}_${expires}_$xVersionSalt"))
+
+        val list = mutableListOf<VideoFormat>()
+        for (i in 0 until files.length()) {
+            val f = files.optJSONObject(i) ?: continue
+            val src = f.optJSONObject("src") ?: continue
+            var u = src.str("view").ifEmpty { src.str("download") }
+            if (u.isEmpty()) continue
+            if (u.startsWith("//")) u = "https:$u"
+            val name = f.str("name").ifEmpty { "default" }
+            val ext = f.str("type").substringAfter('/', "mp4").substringBefore(';').ifEmpty { "mp4" }
+            list += VideoFormat(name, u, ext)
+        }
+        if (list.isEmpty()) error("no downloadable video files found")
+        val user = json.optJSONObject("user")
+        val uploader = user?.str("name").orEmpty().ifEmpty { user?.str("username").orEmpty() }
+        return VideoPost(json.str("title"), uploader, list)
     }
 
     private fun parse(json: JSONObject): Post {

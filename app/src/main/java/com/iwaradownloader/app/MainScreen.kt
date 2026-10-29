@@ -39,6 +39,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
@@ -156,13 +157,13 @@ fun MainScreen(
                 Text(historyLabel, fontSize = 11.sp, color = Color(0xFFA0A0A0), maxLines = 2)
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     TextButton(onClick = onPickHistory, enabled = !busy, modifier = Modifier.weight(1f)) {
-                        Text("Pick existing history file", fontSize = 12.sp, maxLines = 2)
+                        Text("Pick existing history file", fontSize = 12.sp, maxLines = 2, textAlign = TextAlign.Center)
                     }
                     TextButton(onClick = vm::updateYtDlp, enabled = !busy, modifier = Modifier.weight(1f)) { Text("Update yt-dlp") }
                 }
                 if (historyPicked) {
                     TextButton(onClick = vm::useDefaultHistory, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
-                        Text("Use the app's own history file instead", fontSize = 12.sp)
+                        Text("Use the app's own history file instead", fontSize = 12.sp, textAlign = TextAlign.Center)
                     }
                 }
             }

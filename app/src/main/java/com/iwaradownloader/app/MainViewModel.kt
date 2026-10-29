@@ -413,10 +413,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     // ---- yt-dlp update (the Iwara extractor breaks whenever the site changes) ----
     fun updateYtDlp() {
         if (busy.value) return
-        logText.value = "--- Updating yt-dlp... ---"
+        logText.value = "--- Updating yt-dlp (nightly channel, newest Iwara extractor fixes)... ---"
         launchJob {
             try {
-                val status = withContext(Dispatchers.IO) { YoutubeDL.getInstance().updateYoutubeDL(ctx) }
+                val status = withContext(Dispatchers.IO) {
+                    YoutubeDL.getInstance().updateYoutubeDL(ctx, YoutubeDL.UpdateChannel.NIGHTLY)
+                }
                 log("Update result: $status")
             } catch (e: Exception) {
                 log("ERROR: ${e.message}")

@@ -67,16 +67,75 @@ class IwaraImages {
         }
     }
 
-    /** POST /user/login -> user token, POST /user/token -> short-lived access token. */
-    private fun accessToken(root: String, email: String, password: String): String {
-        val login = call(
-            "$root/user/login",
-            body = JSONObject().put("email", email).put("password", password),
-            post = true
-        )
-        val userToken = login.str("token").ifEmpty { error("login failed: no token in response") }
-        val access = call("$root/user/token", token = userToken, post = true)
-        return access.str("accessToken").ifEmpty { error("login failed: no access token in response") }
+    // Logging in on every request trips Iwara's rate limit ("toomanyrequests"), so tokens are cached:
+    // the user token from /user/login is reused to get new access tokens, and an access token is reused
+    // until shortly before it expires.
+    private data class Cached(val token: String, val expiresAtMs: Long)
+    private val userTokens = HashMap<String, Cached>()
+    private val accessTokens = HashMap<String, Cached>()
+
+    /** Reads the "exp" claim (seconds) of a JWT; falls back to [fallbackMs] from now if it cannot be read. */
+    private fun expiry(jwt: String, fallbackMs: Long): Long {
+        return try {
+            val payload = jwt.split('.')[1]
+            val raw = android.util.Base64.decode(payload, android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP)
+            val exp = JSONObject(String(raw, Charsets.UTF_8)).optLong("exp", 0L)
+            if (exp > 0) exp * 1000 else System.currentTimeMillis() + fallbackMs
+        } catch (_: Exception) {
+            System.currentTimeMillis() + fallbackMs
+        }
+    }
+
+    private fun fresh(c: Cached?): String? =
+        c?.takeIf { it.expiresAtMs - System.currentTimeMillis() > 60_000 }?.token
+
+    /** POST /user/login -> user token, POST /user/token -> short-lived access token (both cached). */
+    @Synchronized
+    private fun accessToken(root: String, email: String, password: String, force: Boolean = false): String {
+        val key = "$root|$email|${password.hashCode()}"
+        if (force) accessTokens.remove(key)
+        fresh(accessTokens[key])?.let { return it }
+
+        var userToken = if (force) null else fresh(userTokens[key])
+        if (userToken == null) {
+            val login = call(
+                "$root/user/login",
+                body = JSONObject().put("email", email).put("password", password),
+                post = true
+            )
+            userToken = login.str("token").ifEmpty { error("login failed: no token in response") }
+            userTokens[key] = Cached(userToken, expiry(userToken, 6L * 60 * 60 * 1000))
+        }
+        val access = try {
+            call("$root/user/token", token = userToken, post = true)
+        } catch (e: Exception) {
+            userTokens.remove(key) // stale user token: next try logs in again
+            throw e
+        }
+        val token = access.str("accessToken").ifEmpty { error("login failed: no access token in response") }
+        accessTokens[key] = Cached(token, expiry(token, 30L * 60 * 1000))
+        return token
+    }
+
+    /** Runs [block] with a token; on HTTP 401 the cached token is dropped and the call is retried once. */
+    private fun <T> authed(root: String, credentials: Pair<String, String>?, block: (String?) -> T): T {
+        if (credentials == null) return block(null)
+        return try {
+            block(accessToken(root, credentials.first, credentials.second))
+        } catch (e: Exception) {
+            if (e.message?.startsWith("HTTP 401") == true) {
+                block(accessToken(root, credentials.first, credentials.second, force = true))
+            } else throw e
+        }
+    }
+
+    private fun hint(errors: List<String>, loggedIn: Boolean, privateNote: String): String {
+        val limited = errors.any { it.contains("toomanyrequests", true) || it.contains("HTTP 429") }
+        return when {
+            limited -> "\nIwara is rate-limiting requests (too many requests). Wait a few minutes, then try again."
+            !loggedIn -> "\n$privateNote"
+            else -> ""
+        }
     }
 
     /** Throws if the account cannot log in (used by the Log in dialog). */
@@ -94,13 +153,12 @@ class IwaraImages {
         val errors = mutableListOf<String>()
         for (root in apiRoots) {
             try {
-                val token = credentials?.let { accessToken(root, it.first, it.second) }
-                return@withContext parse(call("$root/image/$id", token))
+                return@withContext authed(root, credentials) { token -> parse(call("$root/image/$id", token)) }
             } catch (e: Exception) {
                 errors += "${root.removePrefix("https://")}: ${e.message}"
             }
         }
-        error("ERROR: could not get images.\n" + errors.joinToString("\n"))
+        error("ERROR: could not get images.\n" + errors.joinToString("\n") + hint(errors, credentials != null, "(private posts need a login)"))
     }
 
     // ---- videos ----
@@ -127,15 +185,14 @@ class IwaraImages {
         val errors = mutableListOf<String>()
         for (root in apiRoots) {
             try {
-                val token = credentials?.let { accessToken(root, it.first, it.second) }
-                return@withContext parseVideo(call("$root/video/$id", token))
+                return@withContext authed(root, credentials) { token -> parseVideo(call("$root/video/$id", token)) }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 errors += "${root.removePrefix("https://")}: ${e.message}"
             }
         }
-        error("ERROR: could not get the video.\n" + errors.joinToString("\n") + "\n(private videos need a login)")
+        error("ERROR: could not get the video.\n" + errors.joinToString("\n") + hint(errors, credentials != null, "(private videos need a login)"))
     }
 
     private fun parseVideo(json: JSONObject): VideoPost {
